@@ -68,21 +68,28 @@ def estimate_tokens(messages: list) -> int:
 def micro_compact(messages: list) -> list:
     # Collect (msg_index, part_index, tool_result_dict) for all tool_result entries
     tool_results = []
+    # 只处理「user 角色」中包含工具结果的消息（工具结果由代码回传给模型，角色为user）
     for msg_idx, msg in enumerate(messages):
         if msg["role"] == "user" and isinstance(msg.get("content"), list):
             for part_idx, part in enumerate(msg["content"]):
                 if isinstance(part, dict) and part.get("type") == "tool_result":
                     tool_results.append((msg_idx, part_idx, part))
+    # 如果工具结果数量 ≤ 保留阈值，无需压缩，直接返回
     if len(tool_results) <= KEEP_RECENT:
         return messages
     # Find tool_name for each result by matching tool_use_id in prior assistant messages
     tool_name_map = {}
     for msg in messages:
+        # 只处理「assistant 角色」的消息（模型调用工具时，角色为assistant）
         if msg["role"] == "assistant":
             content = msg.get("content", [])
             if isinstance(content, list):
                 for block in content:
+                    # 筛选出「tool_use 类型」的块（模型调用工具的指令）
                     if hasattr(block, "type") and block.type == "tool_use":
+                        # 工具结果（tool_result）中只包含 tool_use_id（对应模型调用工具时的 ID），但没有工具名 
+                        # 通过遍历 assistant 消息中的 tool_use 块，建立「ID→工具名」的映射
+                        # 记录：工具调用ID → 工具名（如 "tool_123" → "bash"）
                         tool_name_map[block.id] = block.name
     # Clear old results (keep last KEEP_RECENT)
     to_clear = tool_results[:-KEEP_RECENT]
@@ -90,6 +97,7 @@ def micro_compact(messages: list) -> list:
         if isinstance(result.get("content"), str) and len(result["content"]) > 100:
             tool_id = result.get("tool_use_id", "")
             tool_name = tool_name_map.get(tool_id, "unknown")
+            # 把完整内容替换成工具名
             result["content"] = f"[Previous: used {tool_name}]"
     return messages
 
@@ -116,7 +124,9 @@ def auto_compact(messages: list) -> list:
     summary = response.content[0].text
     # Replace all messages with compressed summary
     return [
+        # 用户角色：包含压缩提示 + 转录文件路径 + 核心摘要（模型会把这当作「输入上下文」）
         {"role": "user", "content": f"[Conversation compressed. Transcript: {transcript_path}]\n\n{summary}"},
+        # 助手角色：固定回复（模拟模型确认收到摘要，保持对话格式完整）
         {"role": "assistant", "content": "Understood. I have the context from the summary. Continuing."},
     ]
 

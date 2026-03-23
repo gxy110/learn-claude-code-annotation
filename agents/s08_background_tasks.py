@@ -50,19 +50,24 @@ SYSTEM = f"You are a coding agent at {WORKDIR}. Use background_run for long-runn
 class BackgroundManager:
     def __init__(self):
         self.tasks = {}  # task_id -> {status, result, command}
-        self._notification_queue = []  # completed task results
-        self._lock = threading.Lock()
+        self._notification_queue = []  # completed task results 操作这种共享资源需要加互斥锁
+        self._lock = threading.Lock()  # 线程锁（保护通知队列）
 
+    # 启动后台任务
     def run(self, command: str) -> str:
         """Start a background thread, return task_id immediately."""
+        # 生成8位短UUID作为唯一任务ID（避免重复，且简洁）
         task_id = str(uuid.uuid4())[:8]
+        # 初始化任务状态：running，无结果，记录命令
         self.tasks[task_id] = {"status": "running", "result": None, "command": command}
+        # 创建后台线程：目标函数为_execute，参数为task_id和command，设为守护线程（daemon=True，主线程退出时，后台线程会自动终止，避免程序挂起）
         thread = threading.Thread(
             target=self._execute, args=(task_id, command), daemon=True
         )
-        thread.start()
+        thread.start() # 启动线程（非阻塞，立即返回）
         return f"Background task {task_id} started: {command[:80]}"
 
+    # 后台线程的执行逻辑
     def _execute(self, task_id: str, command: str):
         """Thread target: run subprocess, capture output, push to queue."""
         try:
@@ -71,15 +76,17 @@ class BackgroundManager:
                 capture_output=True, text=True, timeout=300
             )
             output = (r.stdout + r.stderr).strip()[:50000]
-            status = "completed"
+            status = "completed" # 执行成功，状态为completed
         except subprocess.TimeoutExpired:
             output = "Error: Timeout (300s)"
             status = "timeout"
         except Exception as e:
             output = f"Error: {e}"
             status = "error"
+        # 更新任务状态和结果
         self.tasks[task_id]["status"] = status
         self.tasks[task_id]["result"] = output or "(no output)"
+        # 加锁操作：将完成通知推入队列（避免多线程同时修改队列）
         with self._lock:
             self._notification_queue.append({
                 "task_id": task_id,
@@ -100,12 +107,13 @@ class BackgroundManager:
             lines.append(f"{tid}: [{t['status']}] {t['command'][:60]}")
         return "\n".join(lines) if lines else "No background tasks."
 
+    # 拉取并清空通知队列
     def drain_notifications(self) -> list:
         """Return and clear all pending completion notifications."""
-        with self._lock:
-            notifs = list(self._notification_queue)
-            self._notification_queue.clear()
-        return notifs
+        with self._lock: # 加锁保证原子操作（读取+清空）
+            notifs = list(self._notification_queue) # 复制队列内容
+            self._notification_queue.clear() # 清空队列
+        return notifs # 返回已完成的通知列表
 
 
 BG = BackgroundManager()
@@ -188,12 +196,15 @@ TOOLS = [
 def agent_loop(messages: list):
     while True:
         # Drain background notifications and inject as system message before LLM call
-        notifs = BG.drain_notifications()
-        if notifs and messages:
+        notifs = BG.drain_notifications() # 拉取并清空后台任务完成通知
+        if notifs and messages: # 有通知且消息列表非空时，注入上下文
+            # 格式化通知文本：拼接所有后台任务结果
             notif_text = "\n".join(
                 f"[bg:{n['task_id']}] {n['status']}: {n['result']}" for n in notifs
             )
+            # 步骤1：将后台通知以user角色注入上下文（LLM会识别为用户输入）
             messages.append({"role": "user", "content": f"<background-results>\n{notif_text}\n</background-results>"})
+            # 步骤2：模拟assistant确认收到通知（保持对话格式闭环）
             messages.append({"role": "assistant", "content": "Noted background results."})
         response = client.messages.create(
             model=MODEL, system=SYSTEM, messages=messages,

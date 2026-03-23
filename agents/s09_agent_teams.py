@@ -80,24 +80,32 @@ class MessageBus:
         self.dir = inbox_dir
         self.dir.mkdir(parents=True, exist_ok=True)
 
+    # 发送点对点消息
     def send(self, sender: str, to: str, content: str,
              msg_type: str = "message", extra: dict = None) -> str:
+        # 校验消息类型合法性
         if msg_type not in VALID_MSG_TYPES:
             return f"Error: Invalid type '{msg_type}'. Valid: {VALID_MSG_TYPES}"
+        # 构造基础消息字典
         msg = {
             "type": msg_type,
             "from": sender,
             "content": content,
             "timestamp": time.time(),
         }
+        # 追加扩展字段
         if extra:
             msg.update(extra)
+        # 拼接接收方的收件箱路径
         inbox_path = self.dir / f"{to}.jsonl"
+        # 以追加模式打开文件，写入JSON字符串（每行一个消息，JSONL格式）
         with open(inbox_path, "a") as f:
             f.write(json.dumps(msg) + "\n")
         return f"Sent {msg_type} to {to}"
 
+    # 读取并清空收件箱
     def read_inbox(self, name: str) -> list:
+        # 拼接目标角色的收件箱路径
         inbox_path = self.dir / f"{name}.jsonl"
         if not inbox_path.exists():
             return []
@@ -105,13 +113,14 @@ class MessageBus:
         for line in inbox_path.read_text().strip().splitlines():
             if line:
                 messages.append(json.loads(line))
+        # 清空收件箱文件（读取后立即清空，保证消息只被处理一次）
         inbox_path.write_text("")
         return messages
 
     def broadcast(self, sender: str, content: str, teammates: list) -> str:
-        count = 0
+        count = 0 # 记录成功发送的数量
         for name in teammates:
-            if name != sender:
+            if name != sender: # 避免给自己发消息
                 self.send(sender, name, content, "broadcast")
                 count += 1
         return f"Broadcast to {count} teammates"
@@ -125,7 +134,7 @@ class TeammateManager:
     def __init__(self, team_dir: Path):
         self.dir = team_dir
         self.dir.mkdir(exist_ok=True)
-        self.config_path = self.dir / "config.json"
+        self.config_path = self.dir / "config.json" # 团队配置文件路径
         self.config = self._load_config()
         self.threads = {}
 
@@ -137,43 +146,59 @@ class TeammateManager:
     def _save_config(self):
         self.config_path.write_text(json.dumps(self.config, indent=2))
 
+    # 查找 Agent 配置
     def _find_member(self, name: str) -> dict:
         for m in self.config["members"]:
             if m["name"] == name:
                 return m
         return None
-
+    
+    # 启动 Agent
     def spawn(self, name: str, role: str, prompt: str) -> str:
+        # 查找Agent是否已存在
         member = self._find_member(name)
         if member:
+            # 校验状态：仅idle/shutdown状态的Agent可启动
             if member["status"] not in ("idle", "shutdown"):
                 return f"Error: '{name}' is currently {member['status']}"
-            member["status"] = "working"
-            member["role"] = role
+            member["status"] = "working" # 切换为工作状态
+            member["role"] = role # 更新角色（支持动态修改）
         else:
+            # 新增Agent配置
             member = {"name": name, "role": role, "status": "working"}
             self.config["members"].append(member)
         self._save_config()
+        
+        # 创建后台线程运行Agent
         thread = threading.Thread(
-            target=self._teammate_loop,
-            args=(name, role, prompt),
-            daemon=True,
+            target=self._teammate_loop,  # Agent的核心运行逻辑
+            args=(name, role, prompt),   # 传入名称、角色、任务提示
+            daemon=True,                 # 主线程退出时自动终止Agent线程
         )
-        self.threads[name] = thread
-        thread.start()
+        self.threads[name] = thread  # 记录线程
+        thread.start()  # 启动线程（非阻塞，立即返回
         return f"Spawned '{name}' (role: {role})"
 
+    # Agent 的核心运行循环（线程目标函数）
     def _teammate_loop(self, name: str, role: str, prompt: str):
+        # 构造Agent的系统提示词（定制角色、工作目录、通信方式）
         sys_prompt = (
             f"You are '{name}', role: {role}, at {WORKDIR}. "
             f"Use send_message to communicate. Complete your task."
         )
+        # 初始化Agent的对话上下文（传入用户任务提示）
         messages = [{"role": "user", "content": prompt}]
-        tools = self._teammate_tools()
+        tools = self._teammate_tools() # 获取Agent可用的工具列表
+        
+        # 限制最大运行轮数（50轮），避免无限循环
         for _ in range(50):
+            # 步骤1：读取当前Agent的收件箱（来自其他Agent的消息）（用到通信总线BUS）
             inbox = BUS.read_inbox(name)
             for msg in inbox:
+                # 将其他Agent的消息注入上下文（JSON格式，便于LLM解析）
                 messages.append({"role": "user", "content": json.dumps(msg)})
+            
+            # 步骤2：调用LLM获取响应
             try:
                 response = client.messages.create(
                     model=MODEL,
@@ -183,13 +208,20 @@ class TeammateManager:
                     max_tokens=8000,
                 )
             except Exception:
-                break
+                break # 调用失败则退出循环
+            
+            # 步骤3：记录LLM响应到上下文
             messages.append({"role": "assistant", "content": response.content})
+            
+            # 步骤4：判断是否退出循环（LLM返回最终回答，无需调用工具）
             if response.stop_reason != "tool_use":
                 break
+            
+            # 步骤5：执行工具调用
             results = []
             for block in response.content:
                 if block.type == "tool_use":
+                    # 执行工具（如bash/write_file/send_message）
                     output = self._exec(name, block.name, block.input)
                     print(f"  [{name}] {block.name}: {str(output)[:120]}")
                     results.append({
@@ -197,7 +229,11 @@ class TeammateManager:
                         "tool_use_id": block.id,
                         "content": str(output),
                     })
+            
+            # 步骤6：将工具结果注入上下文（供下一轮LLM调用）
             messages.append({"role": "user", "content": results})
+        
+        # 步骤7：任务完成/循环结束，更新Agent状态为idle
         member = self._find_member(name)
         if member and member["status"] != "shutdown":
             member["status"] = "idle"
@@ -213,6 +249,7 @@ class TeammateManager:
             return _run_write(args["path"], args["content"])
         if tool_name == "edit_file":
             return _run_edit(args["path"], args["old_text"], args["new_text"])
+        # 跨Agent通信工具（核心扩展）
         if tool_name == "send_message":
             return BUS.send(sender, args["to"], args["content"], args.get("msg_type", "message"))
         if tool_name == "read_inbox":
@@ -236,6 +273,7 @@ class TeammateManager:
              "input_schema": {"type": "object", "properties": {}}},
         ]
 
+    # Agent 状态查询
     def list_all(self) -> str:
         if not self.config["members"]:
             return "No teammates."
@@ -344,7 +382,8 @@ TOOLS = [
 
 def agent_loop(messages: list):
     while True:
-        inbox = BUS.read_inbox("lead")
+        # 主循环是lead agent，每轮开始先读取自己的收件箱（来自其他teammate的消息），并将其注入上下文
+        inbox = BUS.read_inbox("lead") 
         if inbox:
             messages.append({
                 "role": "user",

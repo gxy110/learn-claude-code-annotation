@@ -84,6 +84,7 @@ plan_requests = {}
 _tracker_lock = threading.Lock()
 
 
+# 通信总线和S09相比没有变化
 # -- MessageBus: JSONL inbox per teammate --
 class MessageBus:
     def __init__(self, inbox_dir: Path):
@@ -173,21 +174,22 @@ class TeammateManager:
         thread.start()
         return f"Spawned '{name}' (role: {role})"
 
+    # 新特性：实现「受控关闭」
     def _teammate_loop(self, name: str, role: str, prompt: str):
         sys_prompt = (
             f"You are '{name}', role: {role}, at {WORKDIR}. "
-            f"Submit plans via plan_approval before major work. "
-            f"Respond to shutdown_request with shutdown_response."
+            f"Submit plans via plan_approval before major work. "  # 新增：重大工作前需提交计划审批
+            f"Respond to shutdown_request with shutdown_response." # 新增：响应关闭请求需调用shutdown_response
         )
         messages = [{"role": "user", "content": prompt}]
         tools = self._teammate_tools()
-        should_exit = False
+        should_exit = False # 新增：关闭标记
         for _ in range(50):
             inbox = BUS.read_inbox(name)
             for msg in inbox:
                 messages.append({"role": "user", "content": json.dumps(msg)})
             if should_exit:
-                break
+                break # 新增：检测到关闭标记，立即退出循环
             try:
                 response = client.messages.create(
                     model=MODEL,
@@ -211,9 +213,11 @@ class TeammateManager:
                         "tool_use_id": block.id,
                         "content": str(output),
                     })
+                    # 新增：若调用shutdown_response且批准关闭，设置退出标记
                     if block.name == "shutdown_response" and block.input.get("approve"):
                         should_exit = True
             messages.append({"role": "user", "content": results})
+        # 新增：根据退出标记更新状态（shutdown/idle）
         member = self._find_member(name)
         if member:
             member["status"] = "shutdown" if should_exit else "idle"
@@ -233,23 +237,25 @@ class TeammateManager:
             return BUS.send(sender, args["to"], args["content"], args.get("msg_type", "message"))
         if tool_name == "read_inbox":
             return json.dumps(BUS.read_inbox(sender), indent=2)
-        if tool_name == "shutdown_response":
+        # 响应主 Agent 的关闭请求
+        if tool_name == "shutdown_response": 
             req_id = args["request_id"]
             approve = args["approve"]
-            with _tracker_lock:
+            with _tracker_lock: # 加锁更新全局 shutdown_requests 字典（记录请求状态），保证线程安全
                 if req_id in shutdown_requests:
                     shutdown_requests[req_id]["status"] = "approved" if approve else "rejected"
-            BUS.send(
+            BUS.send( # 通过 MessageBus 向主 Agent 发送响应（包含请求 ID 和审批结果）
                 sender, "lead", args.get("reason", ""),
                 "shutdown_response", {"request_id": req_id, "approve": approve},
             )
             return f"Shutdown {'approved' if approve else 'rejected'}"
+        # 提交计划给主 Agent 审批
         if tool_name == "plan_approval":
             plan_text = args.get("plan", "")
             req_id = str(uuid.uuid4())[:8]
-            with _tracker_lock:
+            with _tracker_lock: # 生成唯一 request_id，加锁记录到全局 plan_requests 字典（状态为 pending）
                 plan_requests[req_id] = {"from": sender, "plan": plan_text, "status": "pending"}
-            BUS.send(
+            BUS.send( # 通过 MessageBus 向主 Agent 发送计划审批请求（包含请求 ID 和计划文本）
                 sender, "lead", plan_text, "plan_approval_response",
                 {"request_id": req_id, "plan": plan_text},
             )
@@ -349,9 +355,12 @@ def _run_edit(path: str, old_text: str, new_text: str) -> str:
 
 # -- Lead-specific protocol handlers --
 def handle_shutdown_request(teammate: str) -> str:
+    # 生成唯一请求ID（8位uuid）
     req_id = str(uuid.uuid4())[:8]
+    # 加锁更新全局shutdown_requests（线程安全），标记状态为pending
     with _tracker_lock:
         shutdown_requests[req_id] = {"target": teammate, "status": "pending"}
+    # 通过MessageBus发送关闭请求给目标子Agent（msg_type=shutdown_request）
     BUS.send(
         "lead", teammate, "Please shut down gracefully.",
         "shutdown_request", {"request_id": req_id},
@@ -360,12 +369,15 @@ def handle_shutdown_request(teammate: str) -> str:
 
 
 def handle_plan_review(request_id: str, approve: bool, feedback: str = "") -> str:
+    # 加锁查询全局plan_requests，验证request_id有效性
     with _tracker_lock:
         req = plan_requests.get(request_id)
     if not req:
         return f"Error: Unknown plan request_id '{request_id}'"
+    # 加锁更新计划状态（approved/rejected）
     with _tracker_lock:
         req["status"] = "approved" if approve else "rejected"
+    # 通过MessageBus发送审批结果+反馈给子Agent
     BUS.send(
         "lead", req["from"], feedback, "plan_approval_response",
         {"request_id": request_id, "approve": approve, "feedback": feedback},
@@ -422,7 +434,7 @@ TOOLS = [
      "input_schema": {"type": "object", "properties": {"request_id": {"type": "string"}, "approve": {"type": "boolean"}, "feedback": {"type": "string"}}, "required": ["request_id", "approve"]}},
 ]
 
-
+# 主循环和s09一样
 def agent_loop(messages: list):
     while True:
         inbox = BUS.read_inbox("lead")

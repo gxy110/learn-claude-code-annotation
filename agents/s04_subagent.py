@@ -91,7 +91,8 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
     except Exception as e:
         return f"Error: {e}"
 
-
+# 这里不能把task工具写进来，避免递归生成子agent。要是主agent有很多自己工具，可以再搞个handler
+# 这里主agnet就是多个run_subagent(), 所以直接在主循环里用了
 TOOL_HANDLERS = {
     "bash":       lambda **kw: run_bash(kw["command"]),
     "read_file":  lambda **kw: run_read(kw["path"], kw.get("limit")),
@@ -117,7 +118,7 @@ def run_subagent(prompt: str) -> str:
     sub_messages = [{"role": "user", "content": prompt}]  # fresh context
     for _ in range(30):  # safety limit
         response = client.messages.create(
-            model=MODEL, system=SUBAGENT_SYSTEM, messages=sub_messages,
+            model=MODEL, system=SUBAGENT_SYSTEM, messages=sub_messages, # 这里子agent用的就是干净对话
             tools=CHILD_TOOLS, max_tokens=8000,
         )
         sub_messages.append({"role": "assistant", "content": response.content})
@@ -135,6 +136,7 @@ def run_subagent(prompt: str) -> str:
 
 
 # -- Parent tools: base tools + task dispatcher --
+# task工具的实现就是run_subagent()
 PARENT_TOOLS = CHILD_TOOLS + [
     {"name": "task", "description": "Spawn a subagent with fresh context. It shares the filesystem but not conversation history.",
      "input_schema": {"type": "object", "properties": {"prompt": {"type": "string"}, "description": {"type": "string", "description": "Short description of the task"}}, "required": ["prompt"]}},
@@ -153,7 +155,8 @@ def agent_loop(messages: list):
         results = []
         for block in response.content:
             if block.type == "tool_use":
-                if block.name == "task":
+                if block.name == "task": # 这里已经确认工具名称是 "task"，这是我们定义的子代理工具
+                    # 从 block.input 字典中获取 description 键的值；如果这个键不存在 / 值为 None，就用 "subtask" 作为默认值
                     desc = block.input.get("description", "subtask")
                     print(f"> task ({desc}): {block.input['prompt'][:80]}")
                     output = run_subagent(block.input["prompt"])

@@ -45,6 +45,7 @@ load_dotenv(override=True)
 if os.getenv("ANTHROPIC_BASE_URL"):
     os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
 
+# 工作目录：脚本运行时的当前目录，作为文件操作的沙箱边界
 WORKDIR = Path.cwd()
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL = os.environ["MODEL_ID"]
@@ -68,6 +69,7 @@ def detect_repo_root(cwd: Path) -> Path | None:
         return None
 
 
+# 优先使用 git 仓库根目录，不在 git 仓库中则退回到当前目录
 REPO_ROOT = detect_repo_root(WORKDIR) or WORKDIR
 
 SYSTEM = (
@@ -79,7 +81,8 @@ SYSTEM = (
 )
 
 
-# -- EventBus: append-only lifecycle events for observability --
+# -- EventBus: 追加写入的生命周期事件总线，用于可观测性 --
+# 每个事件写一行 JSON，永不覆盖历史记录，便于审计和调试
 class EventBus:
     def __init__(self, event_log_path: Path):
         self.path = event_log_path
@@ -94,6 +97,7 @@ class EventBus:
         worktree: dict | None = None,
         error: str | None = None,
     ):
+        # 构造事件载荷，附带时间戳、关联任务和 worktree 信息
         payload = {
             "event": event,
             "ts": time.time(),
@@ -118,7 +122,8 @@ class EventBus:
         return json.dumps(items, indent=2)
 
 
-# -- TaskManager: persistent task board with optional worktree binding --
+# -- TaskManager: 持久化任务看板，支持与 worktree 绑定 --
+# 每个任务存为独立的 task_<id>.json 文件，便于并发写入不冲突
 class TaskManager:
     def __init__(self, tasks_dir: Path):
         self.dir = tasks_dir
@@ -181,6 +186,7 @@ class TaskManager:
         return json.dumps(task, indent=2)
 
     def bind_worktree(self, task_id: int, worktree: str, owner: str = "") -> str:
+        # 绑定 worktree 后自动将 pending 任务推进为 in_progress
         task = self._load(task_id)
         task["worktree"] = worktree
         if owner:
@@ -221,7 +227,8 @@ TASKS = TaskManager(REPO_ROOT / ".tasks")
 EVENTS = EventBus(REPO_ROOT / ".worktrees" / "events.jsonl")
 
 
-# -- WorktreeManager: create/list/run/remove git worktrees + lifecycle index --
+# -- WorktreeManager: 创建/列出/运行/删除 git worktree，并维护生命周期索引 --
+# 核心设计：每个 worktree 是独立的目录（执行平面），通过 task_id 与任务（控制平面）关联
 class WorktreeManager:
     def __init__(self, repo_root: Path, tasks: TaskManager, events: EventBus):
         self.repo_root = repo_root
@@ -289,6 +296,7 @@ class WorktreeManager:
             raise ValueError(f"Task {task_id} not found")
 
         path = self.dir / name
+        # 分支名统一使用 wt/<name> 前缀，便于识别和清理
         branch = f"wt/{name}"
         self.events.emit(
             "worktree.create.before",
@@ -366,6 +374,7 @@ class WorktreeManager:
         return text or "Clean worktree"
 
     def run(self, name: str, command: str) -> str:
+        # 简单黑名单过滤危险命令，防止破坏性操作
         dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
         if any(d in command for d in dangerous):
             return "Error: Dangerous command blocked"
@@ -408,6 +417,7 @@ class WorktreeManager:
             args.append(wt["path"])
             self._run_git(args)
 
+            # complete_task=True 时，删除 worktree 的同时自动将关联任务标记为已完成
             if complete_task and wt.get("task_id") is not None:
                 task_id = wt["task_id"]
                 before = json.loads(self.tasks.get(task_id))
@@ -446,6 +456,7 @@ class WorktreeManager:
             raise
 
     def keep(self, name: str) -> str:
+        # keep 表示"保留分支不删除"，仅更新索引状态，不执行 git 操作
         wt = self._find(name)
         if not wt:
             return f"Error: Unknown worktree '{name}'"
@@ -474,8 +485,9 @@ class WorktreeManager:
 WORKTREES = WorktreeManager(REPO_ROOT, TASKS, EVENTS)
 
 
-# -- Base tools (kept minimal, same style as previous sessions) --
+# -- 基础文件工具 --
 def safe_path(p: str) -> Path:
+    # 防止路径穿越攻击，确保操作始终限制在 WORKDIR 内
     path = (WORKDIR / p).resolve()
     if not path.is_relative_to(WORKDIR):
         raise ValueError(f"Path escapes workspace: {p}")
@@ -534,6 +546,7 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
 
 
 TOOL_HANDLERS = {
+    # 工具名 -> 处理函数的分发表，agent_loop 通过此表路由模型的工具调用
     "bash": lambda **kw: run_bash(kw["command"]),
     "read_file": lambda **kw: run_read(kw["path"], kw.get("limit")),
     "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
@@ -727,6 +740,8 @@ TOOLS = [
 
 
 def agent_loop(messages: list):
+    # 标准 agentic 循环：调用模型 -> 执行工具 -> 将结果追加回消息列表 -> 重复
+    # 当模型不再请求工具（stop_reason != "tool_use"）时退出
     while True:
         response = client.messages.create(
             model=MODEL,
@@ -747,6 +762,7 @@ def agent_loop(messages: list):
                     output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
                 except Exception as e:
                     output = f"Error: {e}"
+                # 打印工具调用摘要，方便观察 agent 的行为轨迹
                 print(f"> {block.name}: {str(output)[:200]}")
                 results.append(
                     {

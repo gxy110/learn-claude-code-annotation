@@ -51,6 +51,7 @@ class TaskManager:
         self._next_id = self._max_id() + 1
 
     def _max_id(self) -> int:
+        # 遍历目录下所有task_*.json文件，提取ID（如task_5.json → 5）
         ids = [int(f.stem.split("_")[1]) for f in self.dir.glob("task_*.json")]
         return max(ids) if ids else 0
 
@@ -79,6 +80,7 @@ class TaskManager:
     def update(self, task_id: int, status: str = None,
                add_blocked_by: list = None, add_blocks: list = None) -> str:
         task = self._load(task_id)
+        # 1. 更新任务状态
         if status:
             if status not in ("pending", "in_progress", "completed"):
                 raise ValueError(f"Invalid status: {status}")
@@ -86,20 +88,26 @@ class TaskManager:
             # When a task is completed, remove it from all other tasks' blockedBy
             if status == "completed":
                 self._clear_dependency(task_id)
+
+        # 2. 添加「被哪些任务阻塞」的依赖（blockedBy）
         if add_blocked_by:
+            # 去重：合并原有列表+新列表，转集合去重后转回列表
             task["blockedBy"] = list(set(task["blockedBy"] + add_blocked_by))
+        
+        # 3. 添加「阻塞哪些任务」的依赖（blocks），并维护双向依赖
         if add_blocks:
             task["blocks"] = list(set(task["blocks"] + add_blocks))
-            # Bidirectional: also update the blocked tasks' blockedBy lists
+            # 双向依赖：更新被阻塞任务的blockedBy列表（A blocks B → B blockedBy A）
             for blocked_id in add_blocks:
                 try:
                     blocked = self._load(blocked_id)
-                    if task_id not in blocked["blockedBy"]:
+                    # 给被当前task_id阻塞的任务添加blockedBy依赖（如果还没有的话）
+                    if task_id not in blocked["blockedBy"]: 
                         blocked["blockedBy"].append(task_id)
                         self._save(blocked)
                 except ValueError:
                     pass
-        self._save(task)
+        self._save(task) # 保存更新后的当前任务
         return json.dumps(task, indent=2)
 
     def _clear_dependency(self, completed_id: int):

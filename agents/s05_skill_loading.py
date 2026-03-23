@@ -64,24 +64,34 @@ class SkillLoader:
     def _load_all(self):
         if not self.skills_dir.exists():
             return
+        # 遍历目录下所有SKILL.md文件（rglob=递归遍历，包括子目录），并按路径排序
         for f in sorted(self.skills_dir.rglob("SKILL.md")):
-            text = f.read_text()
-            meta, body = self._parse_frontmatter(text)
-            name = meta.get("name", f.parent.name)
+            text = f.read_text()  # 读取文件完整内容
+            meta, body = self._parse_frontmatter(text) # 解析YAML元信息和正文
+            name = meta.get("name", f.parent.name) # 技能名优先级：YAML里的name > 文件所在目录名（兜底）
             self.skills[name] = {"meta": meta, "body": body, "path": str(f)}
 
+    # Example SKILL.md with YAML frontmatter:
+    # ---
+    # name: pdf
+    # description: Process PDF files - extract text, create PDFs, merge documents. Use when user asks to read PDF, create PDF, or work with PDF files.
+    # ---
     def _parse_frontmatter(self, text: str) -> tuple:
         """Parse YAML frontmatter between --- delimiters."""
+        # 正则匹配：开头的--- + 中间的YAML内容 + --- + 剩下的正文（re.DOTALL让.匹配换行）
+        # group(0)是整个正则匹配串，group(1)是第一个括号匹配（YAML内容），group(2)是第二个括号匹配（正文）
         match = re.match(r"^---\n(.*?)\n---\n(.*)", text, re.DOTALL)
-        if not match:
-            return {}, text
+        if not match: # 没有匹配到YAML frontmatter（比如文件只有纯MD）
+            return {}, text # 返回空元信息，正文=整个文件内容
         meta = {}
+        # 解析YAML内容（简化版解析：按行拆分，按冒号分割键值）
         for line in match.group(1).strip().splitlines():
-            if ":" in line:
-                key, val = line.split(":", 1)
-                meta[key.strip()] = val.strip()
-        return meta, match.group(2).strip()
+            if ":" in line: # 跳过空行/无冒号的行
+                key, val = line.split(":", 1) # 只分割第一个冒号（避免值里有冒号）
+                meta[key.strip()] = val.strip() # 去除键/值两端的空格
+        return meta, match.group(2).strip() # 返回元信息字典 + 正文（去除两端空格）
 
+    # 生成「技能列表简介」，用于嵌入 LLM 的系统提示词（System Prompt），让 LLM 知道有哪些技能可用。
     def get_descriptions(self) -> str:
         """Layer 1: short descriptions for the system prompt."""
         if not self.skills:
@@ -96,6 +106,7 @@ class SkillLoader:
             lines.append(line)
         return "\n".join(lines)
 
+    # 当 LLM 调用「获取技能详情」工具时，返回指定技能的完整 Markdown 正文（包裹在 <skill> 标签中，方便 LLM 识别）。
     def get_content(self, name: str) -> str:
         """Layer 2: full skill body returned in tool_result."""
         skill = self.skills.get(name)

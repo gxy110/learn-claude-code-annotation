@@ -225,3 +225,16 @@ test_providers.py
 # Internal analysis artifacts (not learning material)
 analysis/
 analysis_progress.md
+
+# Local overrides (not learning material)
+greet.py
+hello_world.py
+hello.py
+tasks.json
+test_file.txt
+tests/
+mypackage/
+test_output/
+.worktrees/
+.team/
+
